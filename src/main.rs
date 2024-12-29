@@ -1,310 +1,284 @@
 use rand::Rng;
-use std::convert::TryInto;
 use std::fs::File;
 use std::io::{self, Read};
 use std::time::Instant;
-use std::usize;
 
-const INPUT_SIZE: usize = 784; // Size of the input (28x28 pixels for MNIST)
-const HIDDEN_SIZE: usize = 128; // Number of neurons in the hidden layer
-const OUTPUT_SIZE: usize = 10; // Number of output classes (10 digits)
-const LEARNING_RATE: f64 = 0.0005;
+const INPUT_SIZE: usize = 784;
+const HIDDEN_SIZE: usize = 256; 
+const OUTPUT_SIZE: usize = 10;
+const LEARNING_RATE: f32 = 0.0005; // Changed to f32
+const MOMENTUM: f32 = 0.9;
 const EPOCHS: usize = 20;
-const TRAIN_SPLIT: f64 = 0.8; // Fraction of data to use for training
+const TRAIN_SPLIT: f32 = 0.8;
+const PRINT_INTERVAL: usize = 1000; // Print every 1000 samples
+
+
 
 const TRAIN_IMG_PATH: &str = "./data/train-images.idx3-ubyte";
 const TRAIN_LBL_PATH: &str = "./data/train-labels.idx1-ubyte";
 
-fn read_mnist_images(filename: &str) -> io::Result<(Vec<u8>, usize)> {
-    const IMAGE_SIZE: usize = 28; // Assuming MNIST images are 28x28
-
-    let mut buffer = Vec::new();
-    File::open(filename)?.read_to_end(&mut buffer)?;
-
-    // Ensure the file is large enough
-    if buffer.len() < 16 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "File too small"));
-    }
-
-    // Parse header using big-endian integers
-    let _magic_number = u32::from_be_bytes(buffer[0..4].try_into().unwrap());
-    let n_images = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
-    let rows = u32::from_be_bytes(buffer[8..12].try_into().unwrap());
-    let cols = u32::from_be_bytes(buffer[12..16].try_into().unwrap());
-
-    // Validate dimensions
-    assert_eq!(rows as usize, IMAGE_SIZE, "Unexpected number of rows");
-    assert_eq!(cols as usize, IMAGE_SIZE, "Unexpected number of cols");
-
-    // Extract image data
-    let image_data = buffer[16..].to_vec();
-
-    Ok((image_data, n_images.try_into().unwrap()))
-}
-
 #[derive(Debug)]
 struct Layer {
+    weights: Vec<f32>,
+    biases: Vec<f32>,
+    weight_momentum: Vec<f32>,
+    bias_momentum: Vec<f32>,
     input_size: usize,
     output_size: usize,
-    weights: Vec<f64>,
-    biases: Vec<f64>,
-}
-
-#[derive(Debug)]
-struct Network {
-    hidden: Layer,
-    output: Layer,
 }
 
 impl Layer {
     fn new(input_size: usize, output_size: usize) -> Self {
-        let n = input_size * output_size;
-        let scale = (2.0 / input_size as f64).sqrt();
         let mut rng = rand::thread_rng();
-        // Initialize weights with scaled random values
-        let weights: Vec<f64> = (0..n)
-            .map(|_| (rng.gen::<f64>() - 0.5) * 2.0 * scale)
-            .collect();
-
-        // Initialize biases with zeros
-        let biases = vec![0.0; output_size];
-
+        let scale = (2.0 / input_size as f32).sqrt();
+        
         Layer {
+            weights: (0..input_size * output_size)
+                .map(|_| (rng.gen::<f32>() - 0.5) * 2.0 * scale)
+                .collect(),
+            biases: vec![0.0; output_size],
+            weight_momentum: vec![0.0; input_size * output_size],
+            bias_momentum: vec![0.0; output_size],
             input_size,
             output_size,
-            weights,
-            biases,
         }
     }
-    fn forward(&self, input: &[f64], output: &mut [f64]) {
-        for i in 0..self.output_size {
-            output[i] = self.biases[i];
-        }
+
+    #[inline(always)]
+    fn forward(&self, input: &[f32], output: &mut [f32]) {
+        output.copy_from_slice(&self.biases);
+
         for j in 0..self.input_size {
             let in_j = input[j];
-            let weight_row = &self.weights[j * self.output_size..(j + 1) * self.output_size];
+            let weight_slice = &self.weights[j * self.output_size..(j + 1) * self.output_size];
             for i in 0..self.output_size {
-                output[i] += in_j * weight_row[i];
+                output[i] += in_j * weight_slice[i];
             }
         }
 
-        // Step 2: Apply ReLU activation function to the output
-        output.iter_mut().for_each(|x| *x = x.max(0.0)); // ReLU activation
+        // ReLU activation
+        for val in output.iter_mut() {
+            *val = val.max(0.0);
+        }
     }
+
+    #[inline(always)]
+    fn backward(&mut self, input: &[f32], output_grad: &[f32], learning_rate: f32) {
+        for j in 0..self.input_size {
+            let in_j = input[j];
+            let base_idx = j * self.output_size;
+            
+            for i in 0..self.output_size {
+                let idx = base_idx + i;
+                let grad = output_grad[i] * in_j;
+                self.weight_momentum[idx] = MOMENTUM * self.weight_momentum[idx] + learning_rate * grad;
+                self.weights[idx] -= self.weight_momentum[idx];
+            }
+        }
+
+        for i in 0..self.output_size {
+            self.bias_momentum[i] = MOMENTUM * self.bias_momentum[i] + learning_rate * output_grad[i];
+            self.biases[i] -= self.bias_momentum[i];
+        }
+    }
+}
+
+struct Network {
+    hidden: Layer,
+    output: Layer,
+    // Pre-allocate buffers
+    hidden_output: Vec<f32>,
+    final_output: Vec<f32>,
+    output_grad: Vec<f32>,
+    hidden_grad: Vec<f32>,
 }
 
 impl Network {
     fn new() -> Self {
-        let hidden = Layer::new(INPUT_SIZE, HIDDEN_SIZE);
-        let output = Layer::new(HIDDEN_SIZE, OUTPUT_SIZE);
-
-        Network { hidden, output }
-    }
-}
-
-fn softmax(output: &mut [f64]) {
-    let max = output.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mut sum = 0.0;
-
-    for i in 0..output.len() {
-        output[i] = (output[i] - max).exp();
-        sum += output[i];
+        Network {
+            hidden: Layer::new(INPUT_SIZE, HIDDEN_SIZE),
+            output: Layer::new(HIDDEN_SIZE, OUTPUT_SIZE),
+            hidden_output: vec![0.0; HIDDEN_SIZE],
+            final_output: vec![0.0; OUTPUT_SIZE],
+            output_grad: vec![0.0; OUTPUT_SIZE],
+            hidden_grad: vec![0.0; HIDDEN_SIZE],
+        }
     }
 
-    for i in 0..output.len() {
-        output[i] /= sum;
-    }
-}
+    #[inline(always)]
+    fn train(&mut self, input: &[f32], label: usize, learning_rate: f32) -> f32 {
+        // Forward pass
+        self.hidden.forward(input, &mut self.hidden_output);
+        self.output.forward(&self.hidden_output, &mut self.final_output);
+        
+        // Softmax and cross-entropy
+        let mut max = self.final_output[0];
+        for &val in &self.final_output[1..] {
+            max = max.max(val);
+        }
 
-fn backward(
-    layer: &mut Layer,
-    input: &[f64],
-    output_grad: &[f64],
-    mut input_grad: Option<&mut [f64]>,
-    lr: f64,
-) {
-    for i in 0..layer.output_size {
-        for j in 0..layer.input_size {
-            let idx = j * layer.output_size + i;
-            let grad = output_grad[i] * input[j];
+        let mut sum = 0.0;
+        for val in self.final_output.iter_mut() {
+            *val = (*val - max).exp();
+            sum += *val;
+        }
 
-            // Update weights
-            layer.weights[idx] -= lr * grad;
+        for val in self.final_output.iter_mut() {
+            *val /= sum;
+        }
 
-            // Update input gradient if provided
-            if let Some(ref mut input_grad) = input_grad {
-                input_grad[j] += output_grad[i] * layer.weights[idx];
+        // Compute gradients
+        for i in 0..OUTPUT_SIZE {
+            self.output_grad[i] = self.final_output[i] - (if i == label { 1.0 } else { 0.0 });
+        }
+
+        // Backward pass
+        self.output.backward(&self.hidden_output, &self.output_grad, learning_rate);
+
+        // Compute hidden gradients
+        self.hidden_grad.fill(0.0);
+        for i in 0..HIDDEN_SIZE {
+            if self.hidden_output[i] > 0.0 {  // ReLU derivative
+                let weight_slice = &self.output.weights[i * OUTPUT_SIZE..(i + 1) * OUTPUT_SIZE];
+                for j in 0..OUTPUT_SIZE {
+                    self.hidden_grad[i] += weight_slice[j] * self.output_grad[j];
+                }
             }
         }
 
-        // Update biases
-        layer.biases[i] -= lr * output_grad[i];
+        self.hidden.backward(input, &self.hidden_grad, learning_rate);
+
+        -self.final_output[label].ln()
     }
-}
 
-fn train(net: &mut Network, input: &[f64], label: usize, lr: f64) -> Vec<f64> {
-    let mut hidden_output = [0.0; HIDDEN_SIZE];
-    let mut final_output = [0.0; OUTPUT_SIZE];
-    let mut output_grad = [0.0; OUTPUT_SIZE];
-    let mut hidden_grad = [0.0; HIDDEN_SIZE];
-
-    // Forward Pass: Input to Hidden Layer
-    net.hidden.forward(input, &mut hidden_output);
-    hidden_output
-        .iter_mut()
-        .for_each(|x| *x = f64::max(*x, 0.0)); // ReLU Activation
-
-    // Forward Pass: Hidden to Output Layer
-    net.output.forward(&hidden_output, &mut final_output);
-    let mut final_output_f64: Vec<f64> = final_output.iter().map(|&x| x as f64).collect();
-
-    // Compute Output Gradient (Cross-Entropy Loss)
-    softmax(&mut final_output_f64);
-
-    // Compute Output Gradient (Cross-Entropy Loss)
-    output_grad.iter_mut().enumerate().for_each(|(i, x)| {
-        *x = final_output[i] - if i == label { 1.0 } else { 0.0 };
-    });
-
-    // Backward Pass: Output Layer to Hidden Layer
-    backward(
-        &mut net.output,
-        &hidden_output,
-        &output_grad,
-        Some(&mut hidden_grad),
-        lr,
-    );
-
-    // Backpropagate Through ReLU Activation (Derivatives)
-    hidden_grad
-        .iter_mut()
-        .zip(hidden_output.iter())
-        .for_each(|(grad, &output)| {
-            *grad *= if output > 0.0 { 1.0 } else { 0.0 }; // ReLU Derivative
-        });
-
-    // Backward Pass: Hidden Layer to Input Layer
-    backward(&mut net.hidden, &input, &hidden_grad, None, lr);
-
-    final_output_f64
-}
-
-struct InputData {
-    n_images: usize,
-    images: Vec<u8>,
-    labels: Vec<u8>,
-}
-
-fn read_mnist_labels(filename: &str) -> Result<Vec<u8>, io::Error> {
-    let mut file = File::open(filename)?;
-
-    // Skip the first 4 bytes (Magic number)
-    let mut magic_number = [0u8; 4];
-    file.read_exact(&mut magic_number)?;
-
-    // Read the number of labels
-    let mut n_labels = [0u8; 4];
-    file.read_exact(&mut n_labels)?;
-
-    // Convert from big-endian to little-endian (we need to interpret this number)
-    let n_labels = u32::from_be_bytes(n_labels) as usize;
-
-    // Allocate space for the labels
-    let mut labels = vec![0u8; n_labels];
-
-    // Read the labels
-    file.read_exact(&mut labels)?;
-
-    Ok(labels)
-}
-
-fn predict(net: &Network, input: &[f64]) -> usize {
-    let mut hidden_output = [0.0; HIDDEN_SIZE];
-    let mut final_output = [0.0; OUTPUT_SIZE];
-
-    // Forward Pass: Input to Hidden Layer
-    net.hidden.forward(input, &mut hidden_output);
-
-    // Forward Pass: Hidden to Output Layer
-    net.output.forward(&hidden_output, &mut final_output);
-
-    // Apply Softmax to final_output
-    softmax(&mut final_output);
-
-    // Find the index of the maximum value in final_output
-    let mut max_index = 0;
-    for i in 1..OUTPUT_SIZE {
-        if final_output[i] > final_output[max_index] {
-            max_index = i;
+    fn predict(&mut self, input: &[f32]) -> usize {
+        self.hidden.forward(input, &mut self.hidden_output);
+        self.output.forward(&self.hidden_output, &mut self.final_output);
+        
+        // Simple argmax
+        let mut max_idx = 0;
+        let mut max_val = self.final_output[0];
+        for (i, &val) in self.final_output.iter().enumerate().skip(1) {
+            if val > max_val {
+                max_val = val;
+                max_idx = i;
+            }
         }
+        max_idx
     }
+}
 
-    max_index
+// Helper functions remain mostly the same
+fn read_mnist_images(filename: &str) -> io::Result<(Vec<u8>, usize)> {
+    let mut buffer = Vec::new();
+    File::open(filename)?.read_to_end(&mut buffer)?;
+
+    let n_images = u32::from_be_bytes(buffer[4..8].try_into().unwrap()) as usize;
+    Ok((buffer[16..].to_vec(), n_images))
+}
+
+fn read_mnist_labels(filename: &str) -> io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    File::open(filename)?.read_to_end(&mut buffer)?;
+    Ok(buffer[8..].to_vec())
 }
 
 fn main() {
-    let mut net = Network::new();
-    let mut data = InputData {
-        images: vec![],
-        labels: vec![],
-        n_images: 0,
-    };
+    println!("\n=== Neural Network Training Started ===\n");
+    println!("Configuration:");
+    println!("Learning Rate: {}", LEARNING_RATE);
+    println!("Momentum: {}", MOMENTUM);
+    println!("Epochs: {}", EPOCHS);
+    println!("Train Split: {:.1}%\n", TRAIN_SPLIT * 100.0);
 
-    let learning_rate = LEARNING_RATE;
+    let mut network = Network::new();
+    
+    println!("\nLoading MNIST dataset...");
+    let (images, n_images) = read_mnist_images(TRAIN_IMG_PATH).unwrap();
+    let labels = read_mnist_labels(TRAIN_LBL_PATH).unwrap();
+    println!("MNIST dataset loaded.");
+
+    let train_size = (n_images as f32 * TRAIN_SPLIT) as usize;
+    let test_size = n_images - train_size;
+    println!("Dataset split: {} training samples, {} test samples\n", train_size, test_size);
+
     let mut img = vec![0.0; INPUT_SIZE];
-
-    // Read and shuffle data
-    println!("Reading MNIST data");
-    (data.images, data.n_images) = read_mnist_images(TRAIN_IMG_PATH).unwrap();
-    println!("Finished reading {} images.", data.n_images);
-    println!("Finished reading mnist images: {}", data.n_images);
-    data.labels = read_mnist_labels(TRAIN_LBL_PATH).unwrap();
-    println!("Finished reading {} labels.", data.labels.len());
-    // shuffle_data(&mut data.images, &mut data.labels, data.n_images);
-
-    let train_size = (data.n_images as f64 * TRAIN_SPLIT) as usize;
-    let test_size = data.n_images - train_size;
+    let progress_bar_width = 50;
 
     for epoch in 0..EPOCHS {
+        println!("\nEpoch {} starting...", epoch + 1);
         let start = Instant::now();
         let mut total_loss = 0.0;
-        println!("Epoch {}: Training started...", epoch + 1);
+        let mut correct = 0;
+        let mut last_print_time = Instant::now();
 
+        // Training phase
+        println!("Training phase:");
         for i in 0..train_size {
-            for k in 0..INPUT_SIZE {
-                img[k] = data.images[i * INPUT_SIZE + k] as f64 / 255.0; // Normalize image
+            // Progress bar and statistics
+            if i % PRINT_INTERVAL == 0 {
+                let progress = i as f32 / train_size as f32;
+                let filled = (progress * progress_bar_width as f32) as usize;
+                let bar: String = std::iter::repeat("=").take(filled)
+                    .chain(std::iter::repeat("-").take(progress_bar_width - filled))
+                    .collect();
+                
+                let elapsed = last_print_time.elapsed().as_secs_f32();
+                let samples_per_sec = PRINT_INTERVAL as f32 / elapsed;
+                last_print_time = Instant::now();
+
+                print!("\r[{}] {:.1}% ({:.1} samples/sec)", 
+                    bar, progress * 100.0, samples_per_sec);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
             }
 
-            let final_output = train(
-                &mut net,
-                &img,
-                (*data.labels.get(i).unwrap()).into(),
-                learning_rate,
-            );
-            let index: usize = (*data.labels.get(i).unwrap()).into();
-            total_loss += -(final_output[index] + 1e-10); // Cross-Entropy Loss
-        }
+            // Convert and normalize image data
+            for j in 0..INPUT_SIZE {
+                img[j] = images[i * INPUT_SIZE + j] as f32 / 255.0;
+            }
 
-        let correct = (train_size..data.n_images)
-            .filter(|&i| {
-                let mut img = vec![0.0; INPUT_SIZE];
-                for k in 0..INPUT_SIZE {
-                    img[k] = data.images[i * INPUT_SIZE + k] as f64 / 255.0;
-                }
-                predict(&net, &img) == data.labels[i].into()
-            })
-            .count();
+            let label = labels[i] as usize;
+            total_loss += network.train(&img, label, LEARNING_RATE);
+
+            if network.predict(&img) == label {
+                correct += 1;
+            }
+        }
+        println!("\nTraining phase completed");
+
+        // Testing phase
+        println!("Testing phase:");
+        let mut test_correct = 0;
+        for i in train_size..n_images {
+            if (i - train_size) % PRINT_INTERVAL == 0 {
+                let progress = (i - train_size) as f32 / test_size as f32;
+                let filled = (progress * progress_bar_width as f32) as usize;
+                let bar: String = std::iter::repeat("=").take(filled)
+                    .chain(std::iter::repeat("-").take(progress_bar_width - filled))
+                    .collect();
+                
+                print!("\r[{}] {:.1}%", bar, progress * 100.0);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            }
+
+            for j in 0..INPUT_SIZE {
+                img[j] = images[i * INPUT_SIZE + j] as f32 / 255.0;
+            }
+            if network.predict(&img) == labels[i] as usize {
+                test_correct += 1;
+            }
+        }
+        println!("\nTesting phase completed");
 
         let duration = start.elapsed();
-        let accuracy = correct as f64 / test_size as f64 * 100.0;
-        let avg_loss = total_loss / train_size as f64;
-
-        println!(
-            "Epoch {}, Accuracy: {:.2}%, Avg Loss: {:.4}, Time: {:.2?}",
-            epoch + 1,
-            accuracy,
-            avg_loss,
-            duration
-        );
+        println!("\nEpoch {} Summary:", epoch + 1);
+        println!("Training Accuracy: {:.2}%", correct as f32 / train_size as f32 * 100.0);
+        println!("Test Accuracy: {:.2}%", test_correct as f32 / test_size as f32 * 100.0);
+        println!("Average Loss: {:.4}", total_loss / train_size as f32);
+        println!("Time: {:.2?}", duration);
+        println!("Samples per second: {:.1}", train_size as f32 / duration.as_secs_f32());
+        println!("----------------------------------------");
     }
+
+    println!("\n=== Training Completed ===");
 }
