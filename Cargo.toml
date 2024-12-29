@@ -5,3 +5,26 @@ edition = "2021"
 
 [dependencies]
 rand = "0.8.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+"-C target-cpu=native",
+"-C target-feature=+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2"
+]
+
+[env]
+RUSTFLAGS = "-C target-cpu=native"
